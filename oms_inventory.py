@@ -13,6 +13,10 @@ Usage:
     # Full overwrite write into a sheet (default behavior): whatever is queried gets written as-is
     python oms_inventory.py --feishu-url "https://xcn3xthf3pue.feishu.cn/sheets/UnSRsCAfGhDWkitWOwvcb8o6nRc" --sheet-name "Sheet3"
 
+    # Same, but by sheetId directly (recommended for long-term/server use — a renamed
+    # tab won't break this the way --sheet-name would)
+    python oms_inventory.py --feishu-url "https://xcn3xthf3pue.feishu.cn/sheets/UnSRsCAfGhDWkitWOwvcb8o6nRc" --sheet-id "vVDz1o"
+
     # Refresh every hour (or just set WATCH_INTERVAL_SECONDS=3600 in .env instead of passing this flag)
     python oms_inventory.py --feishu-url "..." --sheet-name "Sheet3" --watch 3600
 
@@ -335,7 +339,16 @@ def main():
         "--sheet-name",
         default=os.environ.get("FEISHU_SHEET_NAME"),
         help="Title of the sheet to write to, e.g. Sheet3 "
-        "(falls back to the FEISHU_SHEET_NAME environment variable if omitted)",
+        "(falls back to the FEISHU_SHEET_NAME environment variable if omitted). "
+        "Ignored if --sheet-id is provided.",
+    )
+    parser.add_argument(
+        "--sheet-id",
+        default=os.environ.get("FEISHU_SHEET_ID"),
+        help="Real sheetId to write to directly, e.g. vVDz1o "
+        "(falls back to the FEISHU_SHEET_ID environment variable if omitted). "
+        "Takes priority over --sheet-name/FEISHU_SHEET_NAME and skips the name lookup, "
+        "so renaming a tab in Feishu won't break this.",
     )
     parser.add_argument(
         "--list-sheets",
@@ -383,16 +396,20 @@ def main():
     feishu_writer = None
     feishu_token = feishu_sheet_id = None
     if args.feishu_url:
-        if not args.sheet_name:
-            log("Error: --sheet-name must also be provided when --feishu-url is given", err=True)
+        if not args.sheet_id and not args.sheet_name:
+            log("Error: either --sheet-id or --sheet-name must be provided when --feishu-url is given", err=True)
             sys.exit(1)
         feishu_token = parse_feishu_token(args.feishu_url)
         try:
             feishu_writer = FeishuSheetClient(
                 os.environ.get("FEISHU_APP_ID", ""), os.environ.get("FEISHU_APP_SECRET", "")
             )
-            feishu_sheet_id = feishu_writer.resolve_sheet_id_by_name(feishu_token, args.sheet_name)
-            log(f"Resolved sheet \"{args.sheet_name}\" -> sheetId={feishu_sheet_id}")
+            if args.sheet_id:
+                feishu_sheet_id = args.sheet_id
+                log(f"Using sheetId directly: {feishu_sheet_id}")
+            else:
+                feishu_sheet_id = feishu_writer.resolve_sheet_id_by_name(feishu_token, args.sheet_name)
+                log(f"Resolved sheet \"{args.sheet_name}\" -> sheetId={feishu_sheet_id}")
         except (AuthError, RuntimeError) as e:
             log(f"Error: {e}", err=True)
             sys.exit(1)
