@@ -72,8 +72,17 @@ import hashlib
 import argparse
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 import requests
+
+# Server runs in UTC; timestamps shown to the user (Eastern Michigan) should be
+# in Eastern time instead, so "Last updated" / "generated at" reflect local time.
+EASTERN_TZ = ZoneInfo("America/Detroit")
+
+
+def now_eastern() -> datetime:
+    return datetime.now(EASTERN_TZ)
 
 try:
     from dotenv import load_dotenv
@@ -388,7 +397,7 @@ class FeishuSheetClient:
         values: List[List[Any]] = [headers]
         values.extend([r[h] for h in headers] for r in rows)
         values.append([])
-        values.append([f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"])
+        values.append([f"Last updated: {now_eastern().strftime('%Y-%m-%d %H:%M:%S %Z')}"])
 
         n_cols = len(headers)
         n_rows = len(values)  # 1-based
@@ -426,7 +435,7 @@ def print_table(rows: List[Dict[str, Any]]) -> None:
     lines = [line, "-" * len(line)]
     for r in rows:
         lines.append(" | ".join(str(r[h]).ljust(w) for h, w in zip(headers, widths)))
-    lines.append(f"\n{len(rows)} records total, generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"\n{len(rows)} records total, generated at: {now_eastern().strftime('%Y-%m-%d %H:%M:%S %Z')}")
     log("\n".join(lines))
 
 
