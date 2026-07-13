@@ -1,6 +1,39 @@
 """
-oms_inventory.py — Query real-time inventory from the OMS and write it to a Feishu sheet
+oms_inventory.py — Query real-time inventory (+ true inbound in-transit) from the
+OMS and write it to a Feishu sheet
 
+=============================================================================
+WHY THIS VERSION IS DIFFERENT (read this if you're used to the old script)
+=============================================================================
+The OMS "综合库存" query (/v1/integratedInventory/pageOpen) has an important,
+easy-to-miss behavior documented by Lingxing themselves:
+
+    "节点起始时间-节点截止时间内，如无库存流水变动，则不会返回该库存的数据"
+    (If there's no inventory-flow / movement within the queried time window,
+    that stock record is simply NOT returned at all.)
+
+This means: a SKU that has 0 on-hand stock but IS sitting "在途" (in transit /
+pending receipt on an open inbound order) will not show up in that endpoint at
+ALL — not as a zero row, but completely absent — because no goods-movement has
+happened yet (the shipment hasn't been received). The old version of this
+script drove everything off that one endpoint, so those SKUs silently
+vanished from the export even though the OMS website clearly shows them with
+an "在途库存" (in-transit) number.
+
+This version fixes that by driving the SKU list from a different, warehouse-
+and-movement-agnostic source — the OMS **product catalog**
+(/v1/product/pagelist) — and then, for each SKU, separately looking up:
+  1. on-hand stock status (same pageOpen endpoint as before), and
+  2. TRUE inbound in-transit quantity, computed from open inbound orders
+     (/v1/inboundOrder/pageList, status = 待入库/收货中) + their per-SKU
+     packing details (/v1/inboundOrder/pageBoxSkuList), as
+     quantity预报 - receivedQuantity已收货, summed per SKU/warehouse.
+
+Any SKU that has neither on-hand stock nor open in-transit still gets one row
+(with everything at 0) so the SKU column always matches the OMS product
+catalog — nothing quietly disappears anymore.
+
+=============================================================================
 Usage:
     export OMS_APP_KEY="your AppKey"
     export OMS_APP_SECRET="your AppSecret"
@@ -11,16 +44,10 @@ Usage:
     python oms_inventory.py --list-sheets --feishu-url "https://xcn3xthf3pue.feishu.cn/sheets/UnSRsCAfGhDWkitWOwvcb8o6nRc"
 
     # Full overwrite write into a sheet (default behavior): whatever is queried gets written as-is.
-    # Before writing, any leftover rows from a previous (longer) run are deleted first
-    # so stale/"zombie" rows don't survive a shrinking dataset.
-    python oms_inventory.py --feishu-url "https://xcn3xthf3pue.feishu.cn/sheets/UnSRsCAfGhDWkitWOwvcb8o6nRc" --sheet-name "Sheet3"
-
-    # Same, but by sheetId directly (recommended for long-term/server use — a renamed
-    # tab won't break this the way --sheet-name would)
     python oms_inventory.py --feishu-url "https://xcn3xthf3pue.feishu.cn/sheets/UnSRsCAfGhDWkitWOwvcb8o6nRc" --sheet-id "vVDz1o"
 
-    # Refresh every hour (or just set WATCH_INTERVAL_SECONDS=3600 in .env instead of passing this flag)
-    python oms_inventory.py --feishu-url "..." --sheet-name "Sheet3" --watch 3600
+    # Refresh every hour (or set WATCH_INTERVAL_SECONDS=3600 in .env instead)
+    python oms_inventory.py --feishu-url "..." --sheet-id "vVDz1o" --watch 3600
 
     # Export to CSV only, don't write to Feishu (useful to sanity-check data locally first)
     python oms_inventory.py --csv snapshot.csv
@@ -28,34 +55,23 @@ Usage:
     # Just print, don't write anywhere
     python oms_inventory.py
 
-    # Dry-run the cleanup logic: probe the sheet's current row count and print
-    # what WOULD be deleted, without actually deleting or writing anything.
-    # Use this once after upgrading, to sanity-check the numbers before trusting it.
+    # Skip the (slower, extra API-call-heavy) inbound in-transit computation,
+    # e.g. if you just want the old-style stock-only snapshot quickly
+    python oms_inventory.py --csv snapshot.csv --skip-transit
+
+    # Dry-run the zombie-row cleanup logic (Feishu write path only)
     python oms_inventory.py --feishu-url "..." --sheet-id "vVDz1o" --dry-run-cleanup
 
 Logging:
     This script just prints to stdout/stderr; it does not write its own log file.
-    When deployed as a systemd service, journald captures and retains this output
-    for you. See the systemd notes below for how to view logs and set retention.
-
-Zombie-row cleanup:
-    write_full() used to size its write range only off the NEW data's row count.
-    If a refresh returns fewer rows than the previous refresh (e.g. some SKUs
-    dropped out, a warehouse emptied, filters changed), the old rows past the
-    new range were left behind untouched — "zombie rows" from a prior run.
-
-    This version fixes that by, before writing, probing how many rows the sheet
-    is actually currently using (via a values GET over a generous range) and,
-    if that is larger than what we're about to write, deleting the extra rows
-    with the Feishu dimension_range DELETE API. Then the fresh data is written.
-
-    A safety guard (MAX_AUTO_DELETE_ROWS) refuses to auto-delete an implausibly
-    large number of rows in one go, in case the probe misfires — this fails loud
-    instead of silently wiping the sheet.
+    When deployed as a systemd service, journald captures and retains this output.
 
 API docs source: https://apidoc-oms.xlwms.com/
   - Signing algorithm: /docs/开发验签工具.md
   - Inventory endpoint: /reference/post_v1-integratedinventory-pageopen.md
+  - Product catalog endpoint: /reference/getproductforpageusingpost_1.md
+  - Inbound order list endpoint: /reference/getorderpageusingpost.md
+  - Inbound order packing-detail endpoint: /reference/pageboxskulistusingpost.md
 Feishu write API: https://open.feishu.cn/document/server-docs/docs/sheets-v3/data-operation/write-data-to-multiple-ranges
 Feishu dimension_range (row delete) API:
   https://open.feishu.cn/document/server-docs/docs/sheets-v3/sheet-rowcol/dimension_range-1
@@ -71,7 +87,7 @@ import hmac
 import hashlib
 import argparse
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import requests
@@ -103,8 +119,32 @@ def log(msg: str = "", err: bool = False) -> None:
 
 OMS_API_BASE = "https://api.xlwms.com/openapi"
 INVENTORY_PATH = "/v1/integratedInventory/pageOpen"
+PRODUCT_LIST_PATH = "/v1/product/pagelist"
+INBOUND_ORDER_LIST_PATH = "/v1/inboundOrder/pageList"
+INBOUND_BOX_SKU_LIST_PATH = "/v1/inboundOrder/pageBoxSkuList"
+
+# Inbound order statuses that mean "not fully received yet" — i.e. still
+# contributing to in-transit quantity. (0-新建 1-待入库 2-收货中 3-已收货
+# 4-已上架 5-已取消 6-待审核 7-驳回)
+OPEN_INBOUND_STATUSES = (1, 2)
 
 FEISHU_TOKEN_RE = re.compile(r"feishu\.cn/sheets/([A-Za-z0-9]+)")
+
+
+def _monthly_windows(start_dt: datetime, end_dt: datetime, max_span_days: int = 30):
+    """Yield (window_start, window_end) datetime pairs covering [start_dt, end_dt],
+    each spanning at most `max_span_days`. The inbound-order-list API's
+    start/end-time filter appears to be designed for ~1-month windows at a
+    time (larger spans, or an unbounded query, trip its internal
+    "查询超过最大条数限制" cap) — so callers that need a longer lookback must
+    chunk their queries into windows like this and merge the results.
+    """
+    cur = start_dt
+    step = timedelta(days=max_span_days)
+    while cur < end_dt:
+        window_end = min(cur + step, end_dt)
+        yield cur, window_end
+        cur = window_end
 
 # Safety guard: if the zombie-row cleanup logic ever thinks it needs to delete
 # more rows than this in one go, it aborts the delete (and the write) instead
@@ -167,9 +207,12 @@ class OmsClient:
         resp.raise_for_status()
         result = resp.json()
         if result.get("code") != 200:
-            raise RuntimeError(f"OMS API returned an error: {result}")
+            raise RuntimeError(f"OMS API returned an error ({path}): {result}")
         return result["data"]
 
+    # ------------------------------------------------------------------
+    # On-hand inventory (existing behavior, unchanged)
+    # ------------------------------------------------------------------
     def query_inventory(
         self,
         sku_list: Optional[List[str]] = None,
@@ -177,6 +220,13 @@ class OmsClient:
         stock_type: Optional[int] = None,
         page_size: int = 100,
     ) -> List[Dict[str, Any]]:
+        """Query on-hand stock via /v1/integratedInventory/pageOpen.
+
+        NOTE: per Lingxing's own docs, a SKU with NO inventory-flow movement in
+        the queried time window will not be returned at all — this is why we
+        no longer treat "absent from this call" as "zero stock" (see
+        build_combined_rows / query_product_catalog for how that's handled).
+        """
         all_records: List[Dict[str, Any]] = []
         page = 1
         start_time = (datetime.now() - timedelta(days=3650)).strftime("%Y-%m-%d %H:%M:%S")
@@ -208,6 +258,189 @@ class OmsClient:
 
         return all_records
 
+    # ------------------------------------------------------------------
+    # Product catalog — the new SKU "source of truth" for the export
+    # ------------------------------------------------------------------
+    def query_product_catalog(
+        self,
+        sku_list: Optional[List[str]] = None,
+        page_size: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Query the full product catalog via /v1/product/pagelist.
+
+        This endpoint is NOT warehouse- or stock-flow-scoped — it simply
+        returns every product SKU that exists in OMS, regardless of whether
+        it currently has any stock or movement. This is what we use to decide
+        which SKUs should appear in the export at all.
+        """
+        all_records: List[Dict[str, Any]] = []
+        page = 1
+        while True:
+            data: Dict[str, Any] = {"page": page, "pageSize": page_size}
+            if sku_list:
+                data["skuList"] = sku_list
+            result = self._post(PRODUCT_LIST_PATH, data)
+            records = result.get("records", []) or []
+            all_records.extend(records)
+
+            total = result.get("total", 0)
+            if page * page_size >= total or not records:
+                break
+            page += 1
+        return all_records
+
+    # ------------------------------------------------------------------
+    # True inbound in-transit — computed from open inbound orders
+    # ------------------------------------------------------------------
+    def query_open_inbound_orders(
+        self, page_size: int = 50, lookback_days: int = 60
+    ) -> List[Dict[str, Any]]:
+        """List inbound orders that are still open (待入库/收货中 — i.e. not
+        yet fully received), across all statuses in OPEN_INBOUND_STATUSES.
+
+        The list endpoint only accepts a single `status` value per call, so we
+        call it once per status and merge results.
+
+        IMPORTANT — two separate limits on the startTime/endTime filter:
+        1. Omitting them entirely makes the server try to scan the ENTIRE
+           order history at once, which trips its own internal cap and
+           returns `{"code": 10002, "msg": "查询超过最大条数限制"}` (query
+           exceeds max row limit) — even on page 1.
+        2. The startTime/endTime window itself appears to be designed for
+           ~1-month spans at a time — passing a full `lookback_days` (e.g.
+           365) worth of range in one call trips the SAME error, just for a
+           different reason (span too wide, not "unbounded").
+
+        So we chunk the full lookback window into ~30-day slices via
+        `_monthly_windows()`, query each slice separately (per status), and
+        merge + dedupe by inboundOrderNo (a single open order could in
+        principle span a chunk boundary depending on how "created" is
+        indexed, though in practice each order only has one creation date).
+
+        TIMEZONE BUFFER: `datetime.now()` here is whatever local time the
+        script happens to run in, but OMS likely timestamps "入库单创建时间"
+        in China Standard Time (UTC+8). If this script runs somewhere behind
+        that (e.g. US Eastern, ~12-13 hours behind), an order created "today"
+        in Beijing time can already be timestamped later than this script's
+        idea of "now", silently excluding it from the window. We pad the
+        upper bound by a couple of days to absorb that gap — querying a
+        little into the future is harmless (orders that don't exist yet
+        simply won't be returned).
+        """
+        all_orders_by_no: Dict[str, Dict[str, Any]] = {}
+        end_dt = datetime.now() + timedelta(days=2)
+        start_dt = end_dt - timedelta(days=lookback_days)
+
+        for window_start, window_end in _monthly_windows(start_dt, end_dt):
+            start_time = window_start.strftime("%Y-%m-%d %H:%M:%S")
+            end_time = window_end.strftime("%Y-%m-%d %H:%M:%S")
+            for status in OPEN_INBOUND_STATUSES:
+                page = 1
+                while True:
+                    data: Dict[str, Any] = {
+                        "page": page,
+                        "pageSize": page_size,
+                        "status": status,
+                        "startTime": start_time,
+                        "endTime": end_time,
+                    }
+                    result = self._post(INBOUND_ORDER_LIST_PATH, data)
+                    records = result.get("records", []) or []
+                    for rec in records:
+                        order_no = rec.get("inboundOrderNo")
+                        if order_no:
+                            all_orders_by_no[order_no] = rec
+
+                    total = result.get("total", 0)
+                    if page * page_size >= total or not records:
+                        break
+                    page += 1
+
+        return list(all_orders_by_no.values())
+
+    def query_inbound_box_sku_list(
+        self, inbound_order_no: str, inbound_type: int, page_size: int = 100
+    ) -> List[Dict[str, Any]]:
+        """Get the per-box, per-SKU packing detail for a single inbound order
+        (quantity预报 vs receivedQuantity已收货 per SKU)."""
+        all_boxes: List[Dict[str, Any]] = []
+        page = 1
+        while True:
+            data: Dict[str, Any] = {
+                "inboundOrderNo": inbound_order_no,
+                "inboundType": inbound_type,
+                "page": page,
+                "pageSize": page_size,
+            }
+            result = self._post(INBOUND_BOX_SKU_LIST_PATH, data)
+            records = result.get("records", []) or []
+            all_boxes.extend(records)
+
+            total = result.get("total", 0)
+            pages = result.get("pages", 1)
+            if page >= pages or not records:
+                break
+            page += 1
+        return all_boxes
+
+    def compute_in_transit_by_sku(
+        self,
+        wh_code_filter: Optional[List[str]] = None,
+        sku_filter: Optional[List[str]] = None,
+        lookback_days: int = 60,
+    ) -> Dict[Tuple[str, str], int]:
+        """Compute true in-transit quantity per (SKU, Warehouse), summed across
+        all open (待入库/收货中) inbound orders.
+
+        in_transit_qty = sum over open orders' boxes of max(quantity - receivedQuantity, 0)
+
+        NOTE: the underlying pageBoxSkuList API has no server-side SKU filter
+        (it's scoped per inbound order, not per SKU), so `sku_filter` — if
+        given — is applied client-side after fetching each order's packing
+        detail. This still saves nothing on API call count, but it DOES make
+        --sku behave consistently with the product-catalog and stock queries,
+        instead of silently ignoring the filter and returning in-transit data
+        for every SKU in the warehouse.
+        """
+        in_transit: Dict[Tuple[str, str], int] = {}
+
+        orders = self.query_open_inbound_orders(lookback_days=lookback_days)
+        wh_filter_set = set(wh_code_filter) if wh_code_filter else None
+        sku_filter_set = set(sku_filter) if sku_filter else None
+
+        log(f"Found {len(orders)} open inbound order(s) (待入库/收货中) to inspect for in-transit quantities.")
+
+        for order in orders:
+            wh_code = order.get("whCode", "")
+            if wh_filter_set is not None and wh_code not in wh_filter_set:
+                continue
+            order_no = order.get("inboundOrderNo")
+            inbound_type = order.get("inboundType")
+            if not order_no or inbound_type is None:
+                continue
+            try:
+                boxes = self.query_inbound_box_sku_list(order_no, inbound_type)
+            except Exception as e:
+                log(f"Warning: failed to fetch packing detail for inbound order {order_no}: {e}", err=True)
+                continue
+
+            for box in boxes:
+                for prod in box.get("productList", []) or []:
+                    sku = prod.get("sku", "")
+                    if not sku:
+                        continue
+                    if sku_filter_set is not None and sku not in sku_filter_set:
+                        continue
+                    qty = prod.get("quantity", 0) or 0
+                    received = prod.get("receivedQuantity", 0) or 0
+                    pending = max(qty - received, 0)
+                    if pending <= 0:
+                        continue
+                    key = (sku, wh_code)
+                    in_transit[key] = in_transit.get(key, 0) + pending
+
+        return in_transit
+
 
 def flatten_record(rec: Dict[str, Any]) -> Dict[str, Any]:
     prod = rec.get("productStockDtl") or {}
@@ -221,8 +454,94 @@ def flatten_record(rec: Dict[str, Any]) -> Dict[str, Any]:
         "Total Stock (Dropship)": rec.get("productTotalAmount", 0),
         "Available Stock": prod.get("availableAmount", 0),
         "Locked Stock": prod.get("lockAmount", 0),
-        "In-Transit Stock": prod.get("transportAmount", 0),
+        "Inbound In-Transit": 0,  # filled in later by build_combined_rows
     }
+
+
+# ----------------------------------------------------------------------
+# Combining product catalog + stock + true in-transit into export rows
+# ----------------------------------------------------------------------
+ROW_COLUMNS = [
+    "SKU",
+    "Product Name",
+    "Warehouse",
+    "Stock Type",
+    "Total Stock (Dropship)",
+    "Available Stock",
+    "Locked Stock",
+    "Inbound In-Transit",
+]
+
+
+def build_combined_rows(
+    products: List[Dict[str, Any]],
+    stock_records: List[Dict[str, Any]],
+    in_transit_map: Dict[Tuple[str, str], int],
+) -> List[Dict[str, Any]]:
+    """Merge the three data sources into one row set, keyed by (SKU, Warehouse, Stock Type).
+
+    - `products`: full OMS product catalog (source of truth for which SKUs exist at all)
+    - `stock_records`: raw records from /v1/integratedInventory/pageOpen (on-hand stock)
+    - `in_transit_map`: {(sku, warehouse): pending_qty} computed from open inbound orders
+
+    Guarantee: every SKU in `products` appears at least once in the output,
+    even if it currently has zero on-hand stock AND zero in-transit.
+    """
+    product_names = {p.get("sku", ""): p.get("productName", "") for p in products if p.get("sku")}
+    all_master_skus = set(product_names.keys())
+
+    combined: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+
+    # 1. Seed with on-hand stock records
+    for rec in stock_records:
+        flat = flatten_record(rec)
+        # Prefer the product catalog's name if we have one (more authoritative/consistent)
+        if flat["SKU"] in product_names and product_names[flat["SKU"]]:
+            flat["Product Name"] = product_names[flat["SKU"]]
+        key = (flat["SKU"], flat["Warehouse"], flat["Stock Type"])
+        combined[key] = flat
+
+    # 2. Fold in true in-transit quantities. In-transit is inherently "Good"
+    #    stock (goods not yet received can't be defective-in-inventory yet),
+    #    so it's attached to the "Good" stock-type row for that SKU/warehouse,
+    #    creating that row (zeroed on-hand fields) if it doesn't exist yet.
+    for (sku, warehouse), qty in in_transit_map.items():
+        key = (sku, warehouse, "Good")
+        if key in combined:
+            combined[key]["Inbound In-Transit"] = combined[key].get("Inbound In-Transit", 0) + qty
+        else:
+            combined[key] = {
+                "SKU": sku,
+                "Product Name": product_names.get(sku, ""),
+                "Warehouse": warehouse,
+                "Stock Type": "Good",
+                "Total Stock (Dropship)": 0,
+                "Available Stock": 0,
+                "Locked Stock": 0,
+                "Inbound In-Transit": qty,
+            }
+
+    # 3. Any catalog SKU that still hasn't shown up anywhere (no stock, no
+    #    in-transit, no movement at all) gets one all-zero placeholder row,
+    #    so the SKU column always matches the OMS product catalog.
+    skus_with_data = {k[0] for k in combined.keys()}
+    for sku in sorted(all_master_skus - skus_with_data):
+        key = (sku, "-", "-")
+        combined[key] = {
+            "SKU": sku,
+            "Product Name": product_names.get(sku, ""),
+            "Warehouse": "-",
+            "Stock Type": "-",
+            "Total Stock (Dropship)": 0,
+            "Available Stock": 0,
+            "Locked Stock": 0,
+            "Inbound In-Transit": 0,
+        }
+
+    rows = list(combined.values())
+    rows.sort(key=lambda r: (r["SKU"], r["Warehouse"], r["Stock Type"]))
+    # Make sure every row has exactly ROW_COLUMNS, in order (matters for CSV/Feishu writes)
+    return [{col: r.get(col, 0 if col not in ("SKU", "Product Name", "Warehouse", "Stock Type") else "") for col in ROW_COLUMNS} for r in rows]
 
 
 # ----------------------------------------------------------------------
@@ -453,21 +772,55 @@ def write_csv(rows: List[Dict[str, Any]], path: str) -> None:
 def run_once(client: OmsClient, args) -> List[Dict[str, Any]]:
     sku_list = args.sku.split(",") if args.sku else None
     wh_list = args.warehouse.split(",") if args.warehouse else None
-    records = client.query_inventory(
+
+    log("Fetching OMS product catalog (SKU source of truth)...")
+    products = client.query_product_catalog(sku_list=sku_list)
+    log(f"  -> {len(products)} product(s) in catalog"
+        + (f" matching --sku filter" if sku_list else ""))
+
+    log("Fetching on-hand stock (integratedInventory/pageOpen)...")
+    stock_records = client.query_inventory(
         sku_list=sku_list,
         wh_code_list=wh_list,
         stock_type=args.stock_type,
         page_size=100,
     )
-    return [flatten_record(r) for r in records]
+    log(f"  -> {len(stock_records)} stock record(s)")
+
+    in_transit_map: Dict[Tuple[str, str], int] = {}
+    if not args.skip_transit:
+        log("Computing true inbound in-transit from open inbound orders (this "
+            "calls the API once per open inbound order — may take a while)...")
+        in_transit_map = client.compute_in_transit_by_sku(
+            wh_code_filter=wh_list, sku_filter=sku_list, lookback_days=args.transit_lookback_days
+        )
+        log(f"  -> in-transit quantities computed for {len(in_transit_map)} (SKU, warehouse) pair(s)")
+    else:
+        log("Skipping inbound in-transit computation (--skip-transit was given); "
+            "'Inbound In-Transit' column will be 0 for everything this run.")
+
+    return build_combined_rows(products, stock_records, in_transit_map)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Query real-time OMS inventory and write it to a Feishu sheet")
-    parser.add_argument("--sku", help="Comma-separated list of SKUs")
-    parser.add_argument("--warehouse", help="Comma-separated warehouse codes, e.g. M60003")
+    parser = argparse.ArgumentParser(
+        description="Query OMS product catalog + on-hand stock + true inbound in-transit, and write it to a Feishu sheet"
+    )
+    parser.add_argument("--sku", help="Comma-separated list of SKUs (filters product catalog + stock query)")
+    parser.add_argument("--warehouse", help="Comma-separated warehouse codes, e.g. M60003 (filters stock + in-transit queries)")
     parser.add_argument("--stock-type", type=int, choices=[0, 1], default=None,
                          help="0=Good, 1=Defective; if omitted, both are included")
+    parser.add_argument("--skip-transit", action="store_true",
+                         help="Skip the inbound-order-based in-transit computation (faster, "
+                         "but 'Inbound In-Transit' will just be 0 for everything)")
+    parser.add_argument("--transit-lookback-days", type=int, default=60,
+                         help="How far back (by inbound-order creation date) to look when "
+                         "searching for open/未完成 inbound orders for the in-transit "
+                         "computation (default: 60). The inbound-order-list API's "
+                         "startTime/endTime filter appears designed for ~1-month spans, "
+                         "so this window is automatically chunked into ~30-day slices "
+                         "under the hood; raise this if you have inbound orders that have "
+                         "been open longer than this (e.g. slow ocean freight).")
     parser.add_argument("--csv", help="Path to export a CSV file")
     parser.add_argument(
         "--feishu-url",
@@ -509,7 +862,19 @@ def main():
         default=int(os.environ.get("WATCH_INTERVAL_SECONDS", "0") or "0"),
         metavar="SECONDS",
         help="Refresh every N seconds (falls back to the WATCH_INTERVAL_SECONDS "
-        "environment variable if omitted; default 0 = run once)",
+        "environment variable if omitted; default 0 = run once). Pass --watch 0 "
+        "explicitly to force a single run even if WATCH_INTERVAL_SECONDS is set in .env.",
+    )
+    parser.add_argument(
+        "--debug-source",
+        choices=["catalog", "stock", "transit"],
+        help="Bypass the merge logic entirely and dump ONE raw data source to "
+        "--csv (or stdout) for inspection: 'catalog' = OMS product list "
+        "(/v1/product/pagelist), 'stock' = on-hand inventory "
+        "(/v1/integratedInventory/pageOpen), 'transit' = computed inbound "
+        "in-transit quantities from open inbound orders. Does not write to "
+        "Feishu. Use this to figure out which of the three data sources isn't "
+        "returning what you expect.",
     )
     args = parser.parse_args()
 
@@ -539,6 +904,45 @@ def main():
     except AuthError as e:
         log(f"Error: {e}", err=True)
         sys.exit(1)
+
+    # --debug-source: dump exactly one raw data source, unmerged, and exit.
+    # No Feishu involved at all — this is purely for figuring out which of the
+    # three sources isn't returning what you expect.
+    if args.debug_source:
+        sku_list = args.sku.split(",") if args.sku else None
+        wh_list = args.warehouse.split(",") if args.warehouse else None
+
+        if args.debug_source == "catalog":
+            log("Fetching OMS product catalog (/v1/product/pagelist) only...")
+            products = client.query_product_catalog(sku_list=sku_list)
+            log(f"  -> {len(products)} product(s)")
+            rows = [{"SKU": p.get("sku", ""), "Product Name": p.get("productName", "")} for p in products]
+
+        elif args.debug_source == "stock":
+            log("Fetching on-hand stock (/v1/integratedInventory/pageOpen) only...")
+            stock_records = client.query_inventory(
+                sku_list=sku_list, wh_code_list=wh_list, stock_type=args.stock_type, page_size=100
+            )
+            log(f"  -> {len(stock_records)} stock record(s)")
+            rows = [flatten_record(rec) for rec in stock_records]
+            for r in rows:
+                r.pop("Inbound In-Transit", None)  # not populated in this raw dump
+
+        else:  # transit
+            log("Computing in-transit quantities from open inbound orders only...")
+            in_transit_map = client.compute_in_transit_by_sku(
+                wh_code_filter=wh_list, sku_filter=sku_list, lookback_days=args.transit_lookback_days
+            )
+            log(f"  -> {len(in_transit_map)} (SKU, warehouse) pair(s) with pending in-transit qty")
+            rows = [
+                {"SKU": sku, "Warehouse": wh, "Pending In-Transit Qty": qty}
+                for (sku, wh), qty in sorted(in_transit_map.items())
+            ]
+
+        print_table(rows)
+        if args.csv:
+            write_csv(rows, args.csv)
+        sys.exit(0)
 
     feishu_writer = None
     feishu_token = feishu_sheet_id = None
@@ -573,7 +977,7 @@ def main():
             sys.exit(1)
         rows = run_once(client, args)
         if not rows:
-            log("No data returned from OMS, nothing to simulate.")
+            log("No data returned, nothing to simulate.")
             sys.exit(0)
         headers = list(rows[0].keys())
         # Same row accounting as write_full: header + data rows + blank + timestamp row.
