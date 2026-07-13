@@ -122,11 +122,21 @@ INVENTORY_PATH = "/v1/integratedInventory/pageOpen"
 PRODUCT_LIST_PATH = "/v1/product/pagelist"
 INBOUND_ORDER_LIST_PATH = "/v1/inboundOrder/pageList"
 INBOUND_BOX_SKU_LIST_PATH = "/v1/inboundOrder/pageBoxSkuList"
+OUTBOUND_ORDER_LIST_PATH = "/v1/outboundOrder/pageList"
+OUTBOUND_ORDER_DETAIL_PATH = "/v1/outboundOrder/detail"
 
 # Inbound order statuses that mean "not fully received yet" — i.e. still
 # contributing to in-transit quantity. (0-新建 1-待入库 2-收货中 3-已收货
 # 4-已上架 5-已取消 6-待审核 7-驳回)
 OPEN_INBOUND_STATUSES = (1, 2)
+
+# Outbound (small-package) order statuses that mean "fully done, no longer
+# holding stock" — i.e. NOT contributing to locked quantity. Everything else
+# (新建/已取面单/仓库处理中/异常/获取面单异常) still has stock reserved
+# against it. (list endpoint: 0-新建 1-已取面单 2-仓库处理中 3-已出库
+# 4-已取消 5-异常; detail endpoint uses a very similar but not identical set —
+# 3 and 4 mean the same thing in both, which is all we rely on here.)
+CLOSED_OUTBOUND_STATUSES = (3, 4)
 
 FEISHU_TOKEN_RE = re.compile(r"feishu\.cn/sheets/([A-Za-z0-9]+)")
 
@@ -219,6 +229,7 @@ class OmsClient:
         wh_code_list: Optional[List[str]] = None,
         stock_type: Optional[int] = None,
         page_size: int = 100,
+        lookback_days: int = 3650,
     ) -> List[Dict[str, Any]]:
         """Query on-hand stock via /v1/integratedInventory/pageOpen.
 
@@ -226,11 +237,20 @@ class OmsClient:
         the queried time window will not be returned at all — this is why we
         no longer treat "absent from this call" as "zero stock" (see
         build_combined_rows / query_product_catalog for how that's handled).
+
+        DIAGNOSTIC NOTE: the API's own documented default for `startTime` is
+        "当前时间的前60天" (60 days before now) — i.e. this endpoint's native
+        usage pattern is short (~60-day) windows, not multi-year ones. Passing
+        a very wide span (like the default lookback_days=3650 here) may be
+        outside what the server actually supports, and could silently return
+        0 records for SKUs whose last stock movement is old, instead of the
+        expected "any movement in the last N years" behavior. `--stock-lookback-days`
+        on the CLI lets you test this directly on a specific SKU.
         """
         all_records: List[Dict[str, Any]] = []
         page = 1
-        start_time = (datetime.now() - timedelta(days=3650)).strftime("%Y-%m-%d %H:%M:%S")
-        end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        start_time = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d %H:%M:%S")
+        end_time = (datetime.now() + timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S")
 
         while True:
             data: Dict[str, Any] = {
@@ -441,6 +461,166 @@ class OmsClient:
 
         return in_transit
 
+    # ------------------------------------------------------------------
+    # True locked stock — computed from open (unshipped) outbound orders
+    # ------------------------------------------------------------------
+    def _fetch_outbound_orders_window(
+        self, start_dt: datetime, end_dt: datetime, page_size: int, min_span_minutes: int = 30
+    ) -> List[Dict[str, Any]]:
+        """Fetch all outbound-order records in [start_dt, end_dt) via full
+        pagination. If the server rejects the window with the
+        "查询超过最大条数限制" (query exceeds max row limit) error — which we've
+        seen happen at different span sizes depending on real order volume —
+        automatically split the window in half and retry each half
+        recursively, down to `min_span_minutes` before giving up and logging
+        a warning (rather than silently dropping data or crashing the whole run).
+        """
+        start_time = start_dt.strftime("%Y-%m-%d %H:%M:%S")
+        end_time = end_dt.strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            records_out: List[Dict[str, Any]] = []
+            page = 1
+            while True:
+                data: Dict[str, Any] = {
+                    "page": page,
+                    "pageSize": page_size,
+                    "timeType": "orderCreateTime",
+                    "startTime": start_time,
+                    "endTime": end_time,
+                }
+                result = self._post(OUTBOUND_ORDER_LIST_PATH, data)
+                records = result.get("records", []) or []
+                records_out.extend(records)
+                total = result.get("total", 0)
+                if page * page_size >= total or not records:
+                    break
+                page += 1
+            return records_out
+        except RuntimeError as e:
+            span = end_dt - start_dt
+            if "10002" not in str(e) and "查询超过最大条数限制" not in str(e):
+                raise  # some other error — don't mask it, let it propagate
+            if span <= timedelta(minutes=min_span_minutes):
+                log(f"Warning: outbound-order window {start_time}..{end_time} still "
+                    f"exceeds the max-row limit even at the smallest split "
+                    f"({min_span_minutes} min) — giving up on this slice, some "
+                    f"locked-stock data may be missing for orders created in it.", err=True)
+                return []
+            mid_dt = start_dt + span / 2
+            log(f"Window {start_time}..{end_time} exceeded max-row limit; "
+                f"splitting into two smaller windows and retrying...")
+            return (
+                self._fetch_outbound_orders_window(start_dt, mid_dt, page_size, min_span_minutes)
+                + self._fetch_outbound_orders_window(mid_dt, end_dt, page_size, min_span_minutes)
+            )
+
+    def query_open_outbound_orders(
+        self, page_size: int = 100, lookback_days: int = 3
+    ) -> List[Dict[str, Any]]:
+        """List small-package outbound orders (/v1/outboundOrder/pageList)
+        that are still "open" — i.e. reserving/locking stock because they
+        haven't been shipped or cancelled yet (status NOT IN
+        CLOSED_OUTBOUND_STATUSES).
+
+        IMPORTANT: this list endpoint has NO status filter parameter at all
+        (unlike the inbound-order list endpoint) — every order created in the
+        queried window comes back regardless of status, and we filter for
+        "still open" client-side using the `status` field on each record.
+
+        Order VOLUME here is typically much higher than inbound orders (every
+        sale generates one), so a fixed monthly chunk size that works fine for
+        inbound orders can still trip "查询超过最大条数限制" for outbound
+        orders during busy periods. Rather than guess a safe fixed window
+        size, we start with ~30-day chunks and let
+        `_fetch_outbound_orders_window()` adaptively split any chunk that's
+        still too large. The upper bound is padded by a couple of days for
+        the same timezone-safety reason as the inbound-order query.
+        """
+        open_orders: List[Dict[str, Any]] = []
+        end_dt = datetime.now() + timedelta(days=2)
+        start_dt = end_dt - timedelta(days=lookback_days)
+
+        for window_start, window_end in _monthly_windows(start_dt, end_dt):
+            records = self._fetch_outbound_orders_window(window_start, window_end, page_size)
+            for rec in records:
+                if rec.get("status") not in CLOSED_OUTBOUND_STATUSES:
+                    open_orders.append(rec)
+
+        # De-dupe by outboundOrderNo in case a window boundary double-counts an order.
+        dedup: Dict[str, Dict[str, Any]] = {o["outboundOrderNo"]: o for o in open_orders if o.get("outboundOrderNo")}
+        return list(dedup.values())
+
+    def query_outbound_order_details(self, outbound_order_nos: List[str]) -> List[Dict[str, Any]]:
+        """Batch-fetch full detail (including per-SKU productList/quantity)
+        for a list of outbound order numbers via /v1/outboundOrder/detail.
+
+        Unlike the inbound-order packing-detail endpoint, this ONE supports a
+        comma-separated batch of order numbers per call (`outboundOrderNoList`),
+        so we chunk into batches instead of calling once per order — much
+        cheaper. The response's `data` is a flat array (no page/records
+        wrapper), so `_post()` already hands us that array directly.
+        """
+        all_details: List[Dict[str, Any]] = []
+        batch_size = 50
+        for i in range(0, len(outbound_order_nos), batch_size):
+            batch = outbound_order_nos[i:i + batch_size]
+            data = {"outboundOrderNoList": ",".join(batch)}
+            result = self._post(OUTBOUND_ORDER_DETAIL_PATH, data)
+            # This endpoint's `data` field is a plain list, not {"records": [...]}.
+            if isinstance(result, list):
+                all_details.extend(result)
+            elif isinstance(result, dict) and "records" in result:
+                all_details.extend(result.get("records", []) or [])
+        return all_details
+
+    def compute_locked_by_sku(
+        self,
+        wh_code_filter: Optional[List[str]] = None,
+        sku_filter: Optional[List[str]] = None,
+        lookback_days: int = 3,
+    ) -> Dict[Tuple[str, str], int]:
+        """Compute true locked (reserved-but-not-yet-shipped) quantity per
+        (SKU, Warehouse), summed across all open outbound orders.
+
+        This replaces the `lockAmount` field from /v1/integratedInventory/pageOpen,
+        which was found to not reliably match the OMS website's 锁定库存 number
+        (same unreliable-field pattern as the old transportAmount/在途 field).
+        """
+        locked: Dict[Tuple[str, str], int] = {}
+
+        orders = self.query_open_outbound_orders(lookback_days=lookback_days)
+        wh_filter_set = set(wh_code_filter) if wh_code_filter else None
+        sku_filter_set = set(sku_filter) if sku_filter else None
+
+        log(f"Found {len(orders)} open (unshipped/uncancelled) outbound order(s) to inspect for locked quantities.")
+
+        # Filter by warehouse BEFORE fetching detail, to avoid wasted detail calls.
+        relevant_orders = [
+            o for o in orders
+            if wh_filter_set is None or o.get("whCode", "") in wh_filter_set
+        ]
+        order_nos = [o["outboundOrderNo"] for o in relevant_orders if o.get("outboundOrderNo")]
+        wh_by_order_no = {o["outboundOrderNo"]: o.get("whCode", "") for o in relevant_orders}
+
+        details = self.query_outbound_order_details(order_nos)
+
+        for detail in details:
+            order_no = detail.get("outboundOrderNo", "")
+            wh_code = detail.get("whCode") or wh_by_order_no.get(order_no, "")
+            for prod in detail.get("productList", []) or []:
+                sku = prod.get("sku", "")
+                if not sku:
+                    continue
+                if sku_filter_set is not None and sku not in sku_filter_set:
+                    continue
+                qty = prod.get("quantity", 0) or 0
+                if qty <= 0:
+                    continue
+                key = (sku, wh_code)
+                locked[key] = locked.get(key, 0) + qty
+
+        return locked
+
 
 def flatten_record(rec: Dict[str, Any]) -> Dict[str, Any]:
     prod = rec.get("productStockDtl") or {}
@@ -453,6 +633,15 @@ def flatten_record(rec: Dict[str, Any]) -> Dict[str, Any]:
         "Stock Type": stock_type_label,
         "Total Stock (Dropship)": rec.get("productTotalAmount", 0),
         "Available Stock": prod.get("availableAmount", 0),
+        # NOTE: this field was verified NOT to always match the OMS website's
+        # 锁定库存 number (e.g. one SKU showed lockAmount=0 here but 2 on the
+        # website) — this looks like a Lingxing-side API bug. A true
+        # locked-stock computation (from open/unshipped outbound orders) was
+        # built and works, but was removed from the default run because
+        # scanning outbound orders is slow (see compute_locked_by_sku() /
+        # --debug-source locked if you want to check a specific SKU manually).
+        # Per instruction, using the API's own (possibly-buggy) field here in
+        # the meantime, on the assumption Lingxing may fix it upstream later.
         "Locked Stock": prod.get("lockAmount", 0),
         "Inbound In-Transit": 0,  # filled in later by build_combined_rows
     }
@@ -477,15 +666,19 @@ def build_combined_rows(
     products: List[Dict[str, Any]],
     stock_records: List[Dict[str, Any]],
     in_transit_map: Dict[Tuple[str, str], int],
+    locked_map: Dict[Tuple[str, str], int],
 ) -> List[Dict[str, Any]]:
-    """Merge the three data sources into one row set, keyed by (SKU, Warehouse, Stock Type).
+    """Merge the data sources into one row set, keyed by (SKU, Warehouse, Stock Type).
 
     - `products`: full OMS product catalog (source of truth for which SKUs exist at all)
-    - `stock_records`: raw records from /v1/integratedInventory/pageOpen (on-hand stock)
+    - `stock_records`: raw records from /v1/integratedInventory/pageOpen (on-hand stock;
+      note the Total/Available fields from here are trusted, but NOT lockAmount — see
+      flatten_record)
     - `in_transit_map`: {(sku, warehouse): pending_qty} computed from open inbound orders
+    - `locked_map`: {(sku, warehouse): locked_qty} computed from open (unshipped) outbound orders
 
     Guarantee: every SKU in `products` appears at least once in the output,
-    even if it currently has zero on-hand stock AND zero in-transit.
+    even if it currently has zero on-hand stock AND zero in-transit AND zero locked.
     """
     product_names = {p.get("sku", ""): p.get("productName", "") for p in products if p.get("sku")}
     all_master_skus = set(product_names.keys())
@@ -521,9 +714,28 @@ def build_combined_rows(
                 "Inbound In-Transit": qty,
             }
 
-    # 3. Any catalog SKU that still hasn't shown up anywhere (no stock, no
-    #    in-transit, no movement at all) gets one all-zero placeholder row,
-    #    so the SKU column always matches the OMS product catalog.
+    # 3. Fold in true locked quantities (from open outbound orders), same
+    #    "attach to the Good row" convention as in-transit, since outbound
+    #    orders draw from good/sellable stock.
+    for (sku, warehouse), qty in locked_map.items():
+        key = (sku, warehouse, "Good")
+        if key in combined:
+            combined[key]["Locked Stock"] = combined[key].get("Locked Stock", 0) + qty
+        else:
+            combined[key] = {
+                "SKU": sku,
+                "Product Name": product_names.get(sku, ""),
+                "Warehouse": warehouse,
+                "Stock Type": "Good",
+                "Total Stock (Dropship)": 0,
+                "Available Stock": 0,
+                "Locked Stock": qty,
+                "Inbound In-Transit": 0,
+            }
+
+    # 4. Any catalog SKU that still hasn't shown up anywhere (no stock, no
+    #    in-transit, no locked, no movement at all) gets one all-zero
+    #    placeholder row, so the SKU column always matches the OMS product catalog.
     skus_with_data = {k[0] for k in combined.keys()}
     for sku in sorted(all_master_skus - skus_with_data):
         key = (sku, "-", "-")
@@ -784,6 +996,7 @@ def run_once(client: OmsClient, args) -> List[Dict[str, Any]]:
         wh_code_list=wh_list,
         stock_type=args.stock_type,
         page_size=100,
+        lookback_days=args.stock_lookback_days,
     )
     log(f"  -> {len(stock_records)} stock record(s)")
 
@@ -799,7 +1012,15 @@ def run_once(client: OmsClient, args) -> List[Dict[str, Any]]:
         log("Skipping inbound in-transit computation (--skip-transit was given); "
             "'Inbound In-Transit' column will be 0 for everything this run.")
 
-    return build_combined_rows(products, stock_records, in_transit_map)
+    # NOTE: locked-stock computation (via open outbound orders) was tried and
+    # works correctly, but was removed from the default run because scanning
+    # outbound orders is slow (high order volume + adaptive window-splitting
+    # retries). 'Locked Stock' is therefore always 0 in the default export.
+    # The underlying compute_locked_by_sku() / --debug-source locked path is
+    # still available if you want to check it manually for a specific SKU.
+    locked_map: Dict[Tuple[str, str], int] = {}
+
+    return build_combined_rows(products, stock_records, in_transit_map, locked_map)
 
 
 def main():
@@ -810,6 +1031,14 @@ def main():
     parser.add_argument("--warehouse", help="Comma-separated warehouse codes, e.g. M60003 (filters stock + in-transit queries)")
     parser.add_argument("--stock-type", type=int, choices=[0, 1], default=None,
                          help="0=Good, 1=Defective; if omitted, both are included")
+    parser.add_argument("--stock-lookback-days", type=int, default=3650,
+                         help="How far back to set startTime for the on-hand stock query "
+                         "(default: 3650, i.e. ~10 years). DIAGNOSTIC: the OMS API's own "
+                         "documented default for this field is 60 days — if a SKU with real "
+                         "current stock is missing from the export, try re-running with "
+                         "--stock-lookback-days 60 on just that SKU (via --debug-source stock "
+                         "--sku ...) to check whether a very wide window is causing silent "
+                         "misses.")
     parser.add_argument("--skip-transit", action="store_true",
                          help="Skip the inbound-order-based in-transit computation (faster, "
                          "but 'Inbound In-Transit' will just be 0 for everything)")
@@ -821,6 +1050,14 @@ def main():
                          "so this window is automatically chunked into ~30-day slices "
                          "under the hood; raise this if you have inbound orders that have "
                          "been open longer than this (e.g. slow ocean freight).")
+    parser.add_argument("--skip-locked", action="store_true",
+                         help="Skip the outbound-order-based locked-stock computation "
+                         "(faster, but 'Locked Stock' will just be 0 for everything)")
+    parser.add_argument("--locked-lookback-days", type=int, default=3,
+                         help="How far back (by outbound-order creation date) to look when "
+                         "searching for open/unshipped outbound orders for the locked-stock "
+                         "computation (default: 3, i.e. 72 hours — outbound orders here are "
+                         "never open longer than that). Raise this if that assumption changes.")
     parser.add_argument("--csv", help="Path to export a CSV file")
     parser.add_argument(
         "--feishu-url",
@@ -867,13 +1104,14 @@ def main():
     )
     parser.add_argument(
         "--debug-source",
-        choices=["catalog", "stock", "transit"],
+        choices=["catalog", "stock", "transit", "locked"],
         help="Bypass the merge logic entirely and dump ONE raw data source to "
         "--csv (or stdout) for inspection: 'catalog' = OMS product list "
         "(/v1/product/pagelist), 'stock' = on-hand inventory "
         "(/v1/integratedInventory/pageOpen), 'transit' = computed inbound "
-        "in-transit quantities from open inbound orders. Does not write to "
-        "Feishu. Use this to figure out which of the three data sources isn't "
+        "in-transit quantities from open inbound orders, 'locked' = computed "
+        "locked quantities from open (unshipped) outbound orders. Does not "
+        "write to Feishu. Use this to figure out which data source isn't "
         "returning what you expect.",
     )
     args = parser.parse_args()
@@ -919,16 +1157,18 @@ def main():
             rows = [{"SKU": p.get("sku", ""), "Product Name": p.get("productName", "")} for p in products]
 
         elif args.debug_source == "stock":
-            log("Fetching on-hand stock (/v1/integratedInventory/pageOpen) only...")
+            log(f"Fetching on-hand stock (/v1/integratedInventory/pageOpen) only "
+                f"(lookback_days={args.stock_lookback_days})...")
             stock_records = client.query_inventory(
-                sku_list=sku_list, wh_code_list=wh_list, stock_type=args.stock_type, page_size=100
+                sku_list=sku_list, wh_code_list=wh_list, stock_type=args.stock_type,
+                page_size=100, lookback_days=args.stock_lookback_days,
             )
             log(f"  -> {len(stock_records)} stock record(s)")
             rows = [flatten_record(rec) for rec in stock_records]
             for r in rows:
                 r.pop("Inbound In-Transit", None)  # not populated in this raw dump
 
-        else:  # transit
+        elif args.debug_source == "transit":
             log("Computing in-transit quantities from open inbound orders only...")
             in_transit_map = client.compute_in_transit_by_sku(
                 wh_code_filter=wh_list, sku_filter=sku_list, lookback_days=args.transit_lookback_days
@@ -937,6 +1177,17 @@ def main():
             rows = [
                 {"SKU": sku, "Warehouse": wh, "Pending In-Transit Qty": qty}
                 for (sku, wh), qty in sorted(in_transit_map.items())
+            ]
+
+        else:  # locked
+            log("Computing locked quantities from open (unshipped) outbound orders only...")
+            locked_map = client.compute_locked_by_sku(
+                wh_code_filter=wh_list, sku_filter=sku_list, lookback_days=args.locked_lookback_days
+            )
+            log(f"  -> {len(locked_map)} (SKU, warehouse) pair(s) with locked qty")
+            rows = [
+                {"SKU": sku, "Warehouse": wh, "Locked Qty": qty}
+                for (sku, wh), qty in sorted(locked_map.items())
             ]
 
         print_table(rows)
