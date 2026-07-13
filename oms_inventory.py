@@ -10,7 +10,9 @@ Usage:
     # List all sheets in the spreadsheet and their real sheetId
     python oms_inventory.py --list-sheets --feishu-url "https://xcn3xthf3pue.feishu.cn/sheets/UnSRsCAfGhDWkitWOwvcb8o6nRc"
 
-    # Full overwrite write into a sheet (default behavior): whatever is queried gets written as-is
+    # Full overwrite write into a sheet (default behavior): whatever is queried gets written as-is.
+    # Before writing, any leftover rows from a previous (longer) run are deleted first
+    # so stale/"zombie" rows don't survive a shrinking dataset.
     python oms_inventory.py --feishu-url "https://xcn3xthf3pue.feishu.cn/sheets/UnSRsCAfGhDWkitWOwvcb8o6nRc" --sheet-name "Sheet3"
 
     # Same, but by sheetId directly (recommended for long-term/server use — a renamed
@@ -26,15 +28,37 @@ Usage:
     # Just print, don't write anywhere
     python oms_inventory.py
 
+    # Dry-run the cleanup logic: probe the sheet's current row count and print
+    # what WOULD be deleted, without actually deleting or writing anything.
+    # Use this once after upgrading, to sanity-check the numbers before trusting it.
+    python oms_inventory.py --feishu-url "..." --sheet-id "vVDz1o" --dry-run-cleanup
+
 Logging:
     This script just prints to stdout/stderr; it does not write its own log file.
     When deployed as a systemd service, journald captures and retains this output
     for you. See the systemd notes below for how to view logs and set retention.
 
+Zombie-row cleanup:
+    write_full() used to size its write range only off the NEW data's row count.
+    If a refresh returns fewer rows than the previous refresh (e.g. some SKUs
+    dropped out, a warehouse emptied, filters changed), the old rows past the
+    new range were left behind untouched — "zombie rows" from a prior run.
+
+    This version fixes that by, before writing, probing how many rows the sheet
+    is actually currently using (via a values GET over a generous range) and,
+    if that is larger than what we're about to write, deleting the extra rows
+    with the Feishu dimension_range DELETE API. Then the fresh data is written.
+
+    A safety guard (MAX_AUTO_DELETE_ROWS) refuses to auto-delete an implausibly
+    large number of rows in one go, in case the probe misfires — this fails loud
+    instead of silently wiping the sheet.
+
 API docs source: https://apidoc-oms.xlwms.com/
   - Signing algorithm: /docs/开发验签工具.md
   - Inventory endpoint: /reference/post_v1-integratedinventory-pageopen.md
 Feishu write API: https://open.feishu.cn/document/server-docs/docs/sheets-v3/data-operation/write-data-to-multiple-ranges
+Feishu dimension_range (row delete) API:
+  https://open.feishu.cn/document/server-docs/docs/sheets-v3/sheet-rowcol/dimension_range-1
 """
 
 import os
@@ -72,6 +96,16 @@ OMS_API_BASE = "https://api.xlwms.com/openapi"
 INVENTORY_PATH = "/v1/integratedInventory/pageOpen"
 
 FEISHU_TOKEN_RE = re.compile(r"feishu\.cn/sheets/([A-Za-z0-9]+)")
+
+# Safety guard: if the zombie-row cleanup logic ever thinks it needs to delete
+# more rows than this in one go, it aborts the delete (and the write) instead
+# of trusting a possibly-wrong probe. Bump this if you genuinely expect huge
+# swings in row count between runs.
+MAX_AUTO_DELETE_ROWS = 5000
+
+# How far down we probe when checking "how many rows does this sheet actually
+# use right now". Should comfortably exceed the largest this sheet will ever get.
+PROBE_ROW_LIMIT = 10000
 
 
 class AuthError(RuntimeError):
@@ -252,8 +286,101 @@ class FeishuSheetClient:
         available = ", ".join(f"{s['title']}({s['sheetId']})" for s in sheets)
         raise RuntimeError(f"No sheet named \"{sheet_name}\" found. Sheets in this spreadsheet: {available}")
 
+    def get_used_row_count(self, spreadsheet_token: str, sheet_id: str, max_probe_col: str) -> int:
+        """Probe how many rows this sheet is CURRENTLY using (1-based count of the
+        last row that has any non-empty cell), by reading a generously-sized range.
+
+        This is what lets us detect "zombie rows" left behind by a previous run
+        that wrote more rows than the current run is about to write.
+        """
+        token = self._get_token()
+        probe_range = f"{sheet_id}!A1:{max_probe_col}{PROBE_ROW_LIMIT}"
+        url = (f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/"
+               f"{spreadsheet_token}/values/{probe_range}")
+        resp = self.session.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
+        resp.raise_for_status()
+        result = resp.json()
+        if result.get("code") != 0:
+            raise RuntimeError(f"Failed to read current row usage from Feishu sheet: {result}")
+        values = result.get("data", {}).get("valueRange", {}).get("values", []) or []
+        last_non_empty = 0
+        for i, row in enumerate(values, start=1):
+            if any(cell not in (None, "", []) for cell in (row or [])):
+                last_non_empty = i
+        return last_non_empty
+
+    def delete_rows(self, spreadsheet_token: str, sheet_id: str, start_index: int, end_index: int) -> None:
+        """Delete rows in the half-open interval [start_index, end_index), 0-based.
+        No-op if end_index <= start_index."""
+        if end_index <= start_index:
+            return
+        token = self._get_token()
+        url = f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/{spreadsheet_token}/dimension_range"
+        body = {
+            "dimension": {
+                "sheetId": sheet_id,
+                "majorDimension": "ROWS",
+                "startIndex": start_index,
+                "endIndex": end_index,
+            }
+        }
+        resp = self.session.delete(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            json=body,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+        if result.get("code") != 0:
+            raise RuntimeError(f"Failed to delete leftover rows: {result}")
+        log(f"Deleted rows {start_index + 1}-{end_index} (1-based) from sheet {sheet_id}")
+
+    def cleanup_zombie_rows(
+        self, spreadsheet_token: str, sheet_id: str, new_n_rows: int, n_cols: int,
+        dry_run: bool = False,
+    ) -> None:
+        """If the sheet currently uses more rows than we're about to write, delete
+        the extra trailing rows first. `new_n_rows` is the 1-based row count of the
+        data we're about to write (including header/footer/timestamp rows)."""
+        try:
+            prev_n_rows = self.get_used_row_count(spreadsheet_token, sheet_id, self._col_letter(n_cols))
+        except Exception as e:
+            log(f"Warning: could not probe previous row count, skipping zombie-row "
+                f"cleanup this run ({e})", err=True)
+            return
+
+        extra = prev_n_rows - new_n_rows
+        if extra <= 0:
+            log(f"No leftover rows to clean up (previous used rows: {prev_n_rows}, "
+                f"new data rows: {new_n_rows}).")
+            return
+
+        if extra > MAX_AUTO_DELETE_ROWS:
+            raise RuntimeError(
+                f"Refusing to auto-delete {extra} rows (previous={prev_n_rows}, "
+                f"new={new_n_rows}) — this exceeds MAX_AUTO_DELETE_ROWS="
+                f"{MAX_AUTO_DELETE_ROWS} and looks like a probe error rather than "
+                f"a real shrink in data. Investigate before raising the limit."
+            )
+
+        # new_n_rows is 1-based count of rows we're keeping (rows 1..new_n_rows).
+        # 0-based delete range is therefore [new_n_rows, prev_n_rows).
+        if dry_run:
+            log(f"[dry-run] Would delete rows {new_n_rows + 1}-{prev_n_rows} (1-based) "
+                f"from sheet {sheet_id} (previous used rows: {prev_n_rows}, "
+                f"new data rows: {new_n_rows}). No changes made.")
+            return
+
+        self.delete_rows(spreadsheet_token, sheet_id, new_n_rows, prev_n_rows)
+
     def write_full(self, spreadsheet_token: str, sheet_id: str, rows: List[Dict[str, Any]]) -> None:
-        """Full overwrite write: header row + all data rows."""
+        """Full overwrite write: header row + all data rows.
+
+        Before writing, checks whether the sheet currently has more rows in use
+        than this write will cover, and if so, deletes the leftover ("zombie")
+        rows first so a shrinking dataset doesn't leave stale data behind.
+        """
         if not rows:
             log("No data, skipping write to Feishu sheet.")
             return
@@ -263,8 +390,12 @@ class FeishuSheetClient:
         values.append([])
         values.append([f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"])
 
-        n_rows = len(values)
         n_cols = len(headers)
+        n_rows = len(values)  # 1-based
+
+        # Delete any leftover rows from a previous, longer run BEFORE writing new data.
+        self.cleanup_zombie_rows(spreadsheet_token, sheet_id, n_rows, n_cols, dry_run=False)
+
         range_str = f"{sheet_id}!A1:{self._col_letter(n_cols)}{n_rows}"
 
         token = self._get_token()
@@ -357,6 +488,13 @@ def main():
         "(useful for verifying names)",
     )
     parser.add_argument(
+        "--dry-run-cleanup",
+        action="store_true",
+        help="Query inventory and print what the zombie-row cleanup WOULD delete, "
+        "without deleting anything or writing to Feishu. Use this once after "
+        "upgrading to sanity-check the row-count probing before trusting it live.",
+    )
+    parser.add_argument(
         "--watch",
         type=int,
         default=int(os.environ.get("WATCH_INTERVAL_SECONDS", "0") or "0"),
@@ -413,12 +551,31 @@ def main():
         except (AuthError, RuntimeError) as e:
             log(f"Error: {e}", err=True)
             sys.exit(1)
-    else:
+    elif not args.dry_run_cleanup:
         log(
             "Notice: --feishu-url was not provided (and FEISHU_SHEET_URL is not set in .env); "
             "this run will only query and print/export CSV, without writing to Feishu.",
             err=True,
         )
+
+    if args.dry_run_cleanup:
+        if not feishu_writer:
+            log("Error: --dry-run-cleanup requires --feishu-url and --sheet-id/--sheet-name", err=True)
+            sys.exit(1)
+        rows = run_once(client, args)
+        if not rows:
+            log("No data returned from OMS, nothing to simulate.")
+            sys.exit(0)
+        headers = list(rows[0].keys())
+        # Same row accounting as write_full: header + data rows + blank + timestamp row.
+        n_rows = 1 + len(rows) + 1 + 1
+        n_cols = len(headers)
+        try:
+            feishu_writer.cleanup_zombie_rows(feishu_token, feishu_sheet_id, n_rows, n_cols, dry_run=True)
+        except Exception as e:
+            log(f"Error during dry-run cleanup check: {e}", err=True)
+            sys.exit(1)
+        sys.exit(0)
 
     def sync(rows):
         if feishu_writer:
